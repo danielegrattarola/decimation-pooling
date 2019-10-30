@@ -13,7 +13,7 @@ If you use any of this code for your own research, please cite the paper with:
 @article{bianchi2018hierarchical,
   title={Hierarchical Representation Learning in Graph Neural Networks with Node Decimation Pooling},
   author={Bianchi, Filippo Maria and Grattarola, Daniele and Livi, Lorenzo and Alippi, Cesare},
-  journal={In preparation},
+  journal={arXiv preprint arXiv:1910.11436},
   year={2019}
 }
 ```
