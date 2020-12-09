@@ -4,13 +4,13 @@ from sklearn.decomposition import non_negative_factorization
 from spektral.utils import convolution
 
 
-def pooling_matrices(A_list, coarsening_levels, pool):
+def pooling_matrices(A_list, coarsening_levels, pool, sparsify=True, sparse_thresh=1e-2):
     """
     Creates all the necessary matrices for decimation pooling and average
     pooling.
     :param A_list: a list of adjacency matrices
     :param coarsening_levels: a list of coarsening levels for pooling
-    :param pool: pooling method to use (decim, graclus, nmf)
+    :param sparsify: if True, applies sparsification
     :return:
         D_out: list of lists with decimation matrices for each graph
         A_out: list of Laplacians pyramids for each graph
@@ -22,32 +22,36 @@ def pooling_matrices(A_list, coarsening_levels, pool):
     D_out = []
 
     if pool == 'decim':
-        for a in A_list:
-            L = convolution.normalized_laplacian(a)
-            graphs, indices = reduction(L,
-                                        levels=max(coarsening_levels) + 1,
-                                        mode='kron')
-            graphs = [convolution.rescale_laplacian(g, lmax=2) for g in graphs]
-            dm, gl = decimation_matrices(levels=coarsening_levels, L=graphs, indices=indices)
+        for a_ in A_list:
+            # Compute pyramid of coarsened graphs
+            adjacencies, indices = reduction(a_,
+                                             levels=max(coarsening_levels) + 1,
+                                             sparsify=sparsify,
+                                             sparse_thresh=sparse_thresh)
+
+            # Get pooling matrices
+            dm, adj = decimation_matrices(levels=coarsening_levels,
+                                          A_list=adjacencies,
+                                          indices=indices)
             D_out.append(dm)
-            A_out.append(gl)
+            A_out.append(adj)
+
     elif pool == 'graclus':
         perm_list = []
         for a in A_list:
             a = sp.csr_matrix(a)  # pooling.coarsen wants sparse matrices
             graphs, perm = coarsen(a, levels=max(coarsening_levels) + 1)
             graphs = [graphs[i] for i in coarsening_levels]  # Keep only the right graphs
-            graphs = [convolution.normalized_adjacency(g) for g in graphs]
             dm = graclus_pooling_matrices(graphs)
             D_out.append(dm)
             A_out.append(graphs)
             perm_list.append(perm)
+
     elif pool == 'nmf':
         for a in A_list:
-            dm, gl = nmf_pooling(A=a, levels=coarsening_levels)
-            gl = [convolution.normalized_adjacency(g) for g in gl]
+            dm, adj = nmf_pooling(A=a, levels=coarsening_levels)
             D_out.append(dm)
-            A_out.append(gl)
+            A_out.append(adj)
     else:
         raise ValueError("pool must be 'decim', 'graclus' or 'nmf'")
 
@@ -60,109 +64,154 @@ def pooling_matrices(A_list, coarsening_levels, pool):
 ################################################################################
 # METHODS FOR GRAPH COARSENING WITH DECIMATION MATRICES (Kron reduction)
 ################################################################################
-def reduction(L, levels, mode='kron', sparsify=True):
+def reduction(A, levels, sparsify=True, sparse_thresh=1e-3):
     """
     Decimates nodes and performs graph reduction.
     INPUTS
-        L: original Laplacian
+        A: adjacency matrix
         levels: number of decimations/ graph reductions to do
-        mode: 'kron' to perform kron reduction, 'square' to take submatrix of L^2
-        sparsify: if True, applies spectral sparsification
+        sparsify: if True, applies sparsification
+        sparse_thresh: if sparsify is True, drop edges lower than sparse_thresh
     OUTPUT
-        graphs: list of reduced graph
+        adjacencies: list of reduced graph
         indexes: indexes of the nodes to keep after each decimation
     """
-    graphs = []
+    adjacencies = []
     indexes = []
 
-    if isinstance(L, np.matrix):
-        L = sp.csc_matrix(L)
-    elif hasattr(L, 'tocsc'):
-        L = L.tocsc()
+    if isinstance(A, np.matrix):
+        A = sp.csc_matrix(A)
+    elif hasattr(A, 'tocsc'):
+        A = A.tocsc()
     else:
-        L = sp.csc_matrix(L)
+        # print('WARNING: got dense adjacency, attempting conversion')
+        A = sp.csc_matrix(A)
+
+    A_new = A
 
     for i in range(levels):
+
+        # compute Laplacian and symmetric Laplacian
+        L = convolution.laplacian(A_new)
+        Ls = convolution.normalized_laplacian(A_new)
+
+        # Compute spectral cut
         if L.shape == (1, 1):
             # No need for pooling
             idx_pos = np.array([0])
         else:
             try:
-                V = sp.linalg.eigsh(L, k=1, which='LM', v0=np.ones(L.shape[0]))[1][:, 0]
-            except Exception:
-                # Random split if eigen-decomposition is not possible
-                print('Eigen-decomposition is not possible, splitting randomly instead.')
-                V = np.random.choice([-1, 1], size=(L.shape[0],))
-            V *= np.sign(V[0])
+                V = sp.linalg.eigsh(Ls, k=1, which='LM', v0=np.ones(A_new.shape[0]))[1][:, 0]
+            except Exception:  # ArpackNoConvergence:
+                # Random split if eigendecomposition is not possible
+                print('Level %d --Eigendecomposition is not possible, splitting randomly instead' % i)
+                V = np.random.choice([-1, 1], size=(A_new.shape[0],))
+
             idx_pos = np.nonzero(V >= 0)[0]
             idx_neg = np.nonzero(V < 0)[0]
 
-        graphs.append(L)
+            # Evaluate the size of the cut 
+            z = np.ones((A_new.shape[0], 1))  # partition vector
+            z[idx_neg] = -1
+            cut_size = eval_cut(A_new, L, z)
+
+            # If the cut is smaller than 0.5, return a random cut
+            if cut_size < 0.5:
+                print("Level %d -- Spectral cut lower than 0.5 (%.2f): returning random cut" % (i, cut_size))
+                V = np.random.choice([-1, 1], size=(Ls.shape[0],))
+                idx_pos = np.nonzero(V >= 0)[0]
+                idx_neg = np.nonzero(V < 0)[0]
+
+        # Link reconstruction with Kron reduction
+        if len(idx_pos) <= 1:
+            # No need to compute Kron reduction with 0 or 1 node
+            Lnew = sp.csc_matrix(-np.ones((1, 1)))  # L = -1
+            idx_pos = np.array([0])  # make sure there is at least 1 index
+        else:
+            # Kron reduction
+            L_red = L[np.ix_(idx_pos, idx_pos)]
+            L_in_out = L[np.ix_(idx_pos, idx_neg)]
+            L_out_in = L[np.ix_(idx_neg, idx_pos)].tocsc()
+            L_comp = L[np.ix_(idx_neg, idx_neg)].tocsc()
+            try:
+                Lnew = L_red - L_in_out.dot(sp.linalg.spsolve(L_comp, L_out_in))
+            except RuntimeError:
+                # If L_comp is exactly singular, damp the inversion with
+                # Marquardt-Levenberg coefficient ml_c
+                ml_c = sp.csc_matrix(sp.eye(L_comp.shape[0]) * 1e-6)
+                Lnew = L_red - L_in_out.dot(sp.linalg.spsolve(ml_c + L_comp, L_out_in))
+
+            # Make the laplacian symmetric if it is almost symmetric
+            if np.abs(Lnew - Lnew.T).sum() < np.spacing(1) * np.abs(Lnew).sum():
+                Lnew = (Lnew + Lnew.T) / 2.
+
+        # Update output lists
+        adjacencies.append(A_new)
         indexes.append(idx_pos)
 
-        if mode == 'kron':
-            if len(idx_pos) == 1:
-                # This happens if the graph cannot be split in half enough times
-                # In this case, we skip pooling and return the identity
-                Lnew = sp.csc_matrix(np.ones((1, 1)))
-            else:
-                # Usual Kron reduction
-                L_red = L[np.ix_(idx_pos, idx_pos)]
-                L_in_out = L[np.ix_(idx_pos, idx_neg)]
-                L_out_in = L[np.ix_(idx_neg, idx_pos)].tocsc()
-                L_comp = L[np.ix_(idx_neg, idx_neg)].tocsc()
-                try:
-                    Lnew = L_red - L_in_out.dot(sp.linalg.spsolve(L_comp, L_out_in))
-                except RuntimeError:
-                    # If L_comp is exactly singular, damp the inversion with
-                    # Marquardt-Levenberg coefficient ml_c
-                    ml_c = sp.csc_matrix(sp.eye(L_comp.shape[0]) * 1e-6)
-                    Lnew = L_red - L_in_out.dot(sp.linalg.spsolve(ml_c + L_comp, L_out_in))
-        elif mode == 'square':
-            Lsq = L.dot(L)
-            Lnew = Lsq[idx_pos, :][:, idx_pos]
-        else:
-            raise ValueError('Possible decimation modes: \'kron\', \'square\'.')
+        A_new = -Lnew
+        A_new.setdiag(0)
+        A_new.eliminate_zeros()
 
-        # Make the laplacian symmetric if it is almost symmetric
-        if np.abs(Lnew - Lnew.T).sum() < np.spacing(1) * np.abs(Lnew).sum():
-            Lnew = (Lnew + Lnew.T) / 2.
+    # Apply sparsification to the list of coarsened adjacencies
+    if sparsify:
+        sparse_adjacencies = [adjacencies[0]]
+        for a_ in adjacencies[1:]:
+            a_ = a_.multiply(np.abs(a_) > sparse_thresh)
+            sparse_adjacencies.append(a_)
+        adjacencies = sparse_adjacencies
 
-        if sparsify:
-            Lnew = sp.csr_matrix(Lnew)
-            Lnew = Lnew.multiply(np.abs(Lnew) > 1e-2)
-        L = Lnew
-
-    return graphs, indexes
+    return adjacencies, indexes
 
 
-def decimation_matrices(levels, L, indices):
+def eval_cut(A, L, z):
+    """
+    Computes the normalized size of a cut in [0,1]
+    """
+    cut = z.T.dot(L.dot(z))
+    cut /= 2 * np.sum(A)
+    return cut
+
+
+def sparsify(A_list, sparse_thresh=1e-3):
+    """
+    Sparsify the adjacency matrices.
+    Useful for debugging and for checking different sparsification thresholds
+    """
+    sparse_adjacencies = []
+    for a_ in A_list:
+        a_ = a_.multiply(np.abs(a_) > sparse_thresh)
+        sparse_adjacencies.append(a_)
+    return sparse_adjacencies
+
+
+def decimation_matrices(levels, A_list, indices):
     """
     INPUT
         levels: list of integes indicating the graphs of the pyramid to keep
-        L: pyramid of Laplacians
+        A_list: pyramid of adjacency matrices
         indices: list of indices of the nodes to keep in each level
     OUTPUT
-        - list of decimation matrices
-        - list of kept Laplacians (the ones in levels) 
+        - S_list: list of decimation matrices
+        - A_keep_list: list of adjacencies to be kept (the ones in levels) 
     """
     S_list = []
-    L_list = []
-    S_prev = sp.eye(L[0].shape[0], dtype=np.float32)
+    A_keep_list = []
+    S_prev = sp.eye(A_list[0].shape[0], dtype=np.float32)
     for i in range(max(levels) + 1):
-        nodes_i = L[i].shape[0]
+        nodes_i = A_list[i].shape[0]
         I = sp.eye(nodes_i, dtype=np.float32)
         S_i = I.tocsr()[indices[i], :]
         S_prev = S_i.dot(S_prev)
         if i in levels:
-            L_list.append(L[i])
+            A_keep_list.append(A_list[i])
         if i + 1 == max(levels) + 1:
             S_list.append(S_prev)
         elif i + 1 in levels:
             S_list.append(S_prev)
             S_prev = sp.eye(len(indices[i]), dtype=np.float32)
 
-    return S_list, L_list
+    return S_list, A_keep_list
 
 
 ################################################################################
@@ -214,8 +263,8 @@ def graclus_pooling_matrices(graphs):
         I = np.eye(M_i, dtype=np.float32)
         S.append(I[1::offset, :])
 
-    # This last matrix will not be used, it's just for having the same number of
-    # pooling mats and coarsened adjs
+    # This last matrix will not be used
+    # is here just for having the same number of pooling mats and coarsened adjs
     S.append(np.eye(M_ii, dtype=np.float32))
 
     return S
